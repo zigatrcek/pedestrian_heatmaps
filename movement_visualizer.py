@@ -112,7 +112,7 @@ class MovementVisualizer:
             blended = background_float + (colored_float * intensity_scale * mask)
             result = np.clip(blended, 0, 255, casting='unsafe').astype(np.uint8)
         
-        return result
+        return result.astype(np.uint8)
     
     def create_timelapse(self, output_path, frame_stride=10, activity_threshold=75,
                         intensity_scale=1.0, no_background=False):

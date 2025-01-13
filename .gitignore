@@ -166,3 +166,7 @@ visualization.*
 data/
 remote_data/
 local_data/
+*.mp4
+*.png
+*.jpg
+*.pdf
