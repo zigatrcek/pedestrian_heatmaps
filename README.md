@@ -42,8 +42,6 @@ python movement_visualizer.py movement_data/[session_dir]
 
 Options:
 ```bash
-# Multi-color visualization (tracks different people)
-python movement_visualizer.py movement_data/[session_dir] --use-colors
 
 # Create trails visualization
 python movement_visualizer.py movement_data/[session_dir] --style trails
