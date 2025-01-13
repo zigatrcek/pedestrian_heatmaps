@@ -6,10 +6,10 @@ from pathlib import Path
 from datetime import datetime
 import time
 import argparse
-import colorsys
+import random
 
 class MovementDataCollector:
-    def __init__(self, save_dir='movement_data', model_path='yolov8n-pose.pt', 
+    def __init__(self, save_dir='movement_data', model_path='yolov8n.pt', 
                  detection_fps=10, resolution=(300, 300), kernel_size=(31, 31),
                  is_camera=False, video_fps=30.0):
         self.model = YOLO(model_path)
@@ -17,17 +17,25 @@ class MovementDataCollector:
         self.save_dir.mkdir(exist_ok=True)
         
         self.target_size = resolution
-        self.accumulators = {}  # Dict to store individual heatmaps
+        self.colors = [
+            (255, 0, 0),    # Blue
+            (0, 255, 0),    # Green
+            (0, 0, 255),    # Red
+            (255, 255, 0),  # Cyan
+            (255, 0, 255)   # Magenta
+        ]
+        self.accumulators = {i: np.zeros(self.target_size, dtype=np.float32) 
+                           for i in range(len(self.colors))}
         self.background_saved = False
+        self.available_colors = list(range(len(self.colors)))
+        self.person_colors = {}
         
         self.kernel_size = kernel_size
         self.kernel = self._create_gaussian_kernel(kernel_size)
         
         self.detection_interval = int(30 / detection_fps)
         self.frame_count = 0
-        self.last_detections = {}  # Track last known positions
-        self.person_colors = {}  # Store colors for each tracked person
-        self.next_person_id = 0
+        self.last_detections = {}
         
         self.session_dir = self.save_dir / datetime.now().strftime('%Y%m%d_%H%M%S')
         self.session_dir.mkdir(exist_ok=True)
@@ -53,29 +61,23 @@ class MovementDataCollector:
         }
         self._save_metadata()
 
-    def _generate_unique_color(self):
-        """Generate a unique color using HSV color space."""
-        hue = (self.next_person_id * 0.618033988749895) % 1.0  # Golden ratio
-        rgb = colorsys.hsv_to_rgb(hue, 0.9, 0.95)
-        return tuple(int(x * 255) for x in rgb)
-
     def _assign_person_id(self, box):
-        """Assign ID to person based on position similarity."""
         x, y = box[:2]
         min_dist = float('inf')
         matched_id = None
 
         for pid, last_box in self.last_detections.items():
             dist = np.sqrt((x - last_box[0])**2 + (y - last_box[1])**2)
-            if dist < min_dist and dist < 50:  # Threshold for matching
+            if dist < min_dist and dist < 50:
                 min_dist = dist
                 matched_id = pid
 
         if matched_id is None:
-            matched_id = self.next_person_id
-            self.next_person_id += 1
-            self.person_colors[matched_id] = self._generate_unique_color()
-            self.accumulators[matched_id] = np.zeros(self.target_size, dtype=np.float32)
+            if not self.available_colors:
+                self.available_colors = list(range(len(self.colors)))
+            color_idx = random.choice(self.available_colors)
+            self.available_colors.remove(color_idx)
+            matched_id = color_idx
 
         return matched_id
 
@@ -100,31 +102,24 @@ class MovementDataCollector:
         accumulator[y_slice, x_slice] += kernel * contribution
 
     def _create_heatmap_overlay(self, frame):
-        # Create separate heatmap for each person
         blended = frame.astype(np.float32)
         
-        for person_id, accumulator in self.accumulators.items():
+        for color_idx, accumulator in self.accumulators.items():
             max_val = np.max(accumulator)
             if max_val > 0:
                 normalized = (accumulator / max_val * 255).clip(0, 255)
-            else:
-                normalized = accumulator
+                normalized[normalized < self.activity_threshold * 255] = 0
+                
+                colored_heatmap = np.zeros((normalized.shape[0], normalized.shape[1], 3), dtype=np.uint8)
+                color = self.colors[color_idx]
+                for i in range(3):
+                    colored_heatmap[..., i] = normalized * (color[i] / 255)
 
-            normalized[normalized < self.activity_threshold * 255] = 0
-            
-            # Create colored heatmap using person's color
-            color = self.person_colors[person_id]
-            colored_heatmap = np.zeros((normalized.shape[0], normalized.shape[1], 3), dtype=np.uint8)
-            for i in range(3):
-                colored_heatmap[..., i] = normalized * (color[i] / 255)
+                mask = (normalized > 0)[..., np.newaxis]
+                overlay = colored_heatmap.astype(np.float32) * self.intensity_scale
+                blended = np.where(mask, cv2.addWeighted(blended, 1.0, overlay, 0.6, 0), blended)
 
-            # Create mask and blend
-            mask = (normalized > 0)[..., np.newaxis]
-            overlay = colored_heatmap.astype(np.float32) * self.intensity_scale
-            blended = np.where(mask, cv2.addWeighted(blended, 1.0, overlay, 0.6, 0), blended)
-
-        result = np.clip(blended, 0, 255).astype(np.uint8)
-        return result
+        return np.clip(blended, 0, 255).astype(np.uint8)
     
     def initialize_video_writer(self):
         if self.video_writer is not None:
@@ -133,46 +128,29 @@ class MovementDataCollector:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         video_path = str(self.session_dir / ('camera_latest.mp4' if self.is_camera else f'recording_{timestamp}.mp4'))
 
-        codecs = [
-            ('avc1', 'mp4'),
-            ('h264', 'mp4'),
-            ('hevc', 'mp4'),
-            ('vp09', 'webm')
-        ]
-
+        codecs = [('avc1', 'mp4'), ('h264', 'mp4'), ('hevc', 'mp4'), ('vp09', 'webm')]
         for codec, ext in codecs:
             if ext != 'mp4':
                 video_path = str(Path(video_path).with_suffix(f'.{ext}'))
-            
             fourcc = cv2.VideoWriter_fourcc(*codec)
-            writer = cv2.VideoWriter(
-                video_path,
-                fourcc,
-                self.video_fps,
-                self.target_size,
-                True
-            )
-            
+            writer = cv2.VideoWriter(video_path, fourcc, self.video_fps, self.target_size, True)
             if writer.isOpened():
                 self.video_writer = writer
                 return
 
-        if self.video_writer is None or not self.video_writer.isOpened():
-            video_path = str(Path(video_path).with_suffix('.avi'))
-            self.video_writer = cv2.VideoWriter(
-                video_path,
-                cv2.VideoWriter_fourcc(*'MJPG'),
-                self.video_fps,
-                self.target_size,
-                True
-            )
+        video_path = str(Path(video_path).with_suffix('.avi'))
+        self.video_writer = cv2.VideoWriter(
+            video_path,
+            cv2.VideoWriter_fourcc(*'MJPG'),
+            self.video_fps,
+            self.target_size,
+            True
+        )
 
     def check_recording_duration(self):
-        if self.is_camera:
-            current_time = time.time()
-            if current_time - self.recording_start_time >= 60:
-                self.initialize_video_writer()
-                self.recording_start_time = current_time
+        if self.is_camera and time.time() - self.recording_start_time >= 60:
+            self.initialize_video_writer()
+            self.recording_start_time = time.time()
     
     def _save_metadata(self):
         with open(self.session_dir / 'metadata.json', 'w') as f:
@@ -180,8 +158,7 @@ class MovementDataCollector:
     
     def _save_background(self, frame):
         if not self.background_saved:
-            bg_path = self.session_dir / 'background.jpg'
-            cv2.imwrite(str(bg_path), frame)
+            cv2.imwrite(str(self.session_dir / 'background.jpg'), frame)
             self.background_saved = True
     
     def process_frame(self, frame):
@@ -237,9 +214,9 @@ class MovementDataCollector:
         self._apply_gaussian_contribution(region, self.accumulators[person_id])
     
     def _save_frame_data(self):
-        for person_id, accumulator in self.accumulators.items():
-            frame_path = self.session_dir / f'person_{person_id}_frame_{self.metadata["frame_count"]:06d}.npy'
-            np.save(frame_path, accumulator)
+        for color_idx, accumulator in self.accumulators.items():
+            np.save(self.session_dir / f'color_{color_idx}_frame_{self.metadata["frame_count"]:06d}.npy', 
+                   accumulator)
         
         self.metadata['frame_count'] += 1
         if self.metadata['frame_count'] % 100 == 0:
@@ -275,20 +252,14 @@ def main():
     args = parser.parse_args()
     
     is_camera = args.video.isdigit()
-    if is_camera:
-        cap = cv2.VideoCapture(int(args.video))
-        video_fps = 30.0
-    else:
-        cap = cv2.VideoCapture(args.video)
-        video_fps = cap.get(cv2.CAP_PROP_FPS)
+    cap = cv2.VideoCapture(int(args.video) if is_camera else args.video)
+    video_fps = 30.0 if is_camera else cap.get(cv2.CAP_PROP_FPS)
     
     if not cap.isOpened():
         print(f"Error: Could not open video source: {args.video}")
         return
     
-    frame_limit = None
-    if args.duration:
-        frame_limit = int(args.duration * video_fps)
+    frame_limit = int(args.duration * video_fps) if args.duration else None
     
     collector = MovementDataCollector(
         save_dir=args.output,
@@ -316,10 +287,8 @@ def main():
                 break
                 
             frame_count += 1
-            
             if args.duration:
-                progress = (frame_count / frame_limit) * 100
-                print(f"\rProgress: {progress:.1f}%", end='')
+                print(f"\rProgress: {frame_count * 100 / frame_limit:.1f}%", end='')
     
     finally:
         print("\nCleaning up...")
