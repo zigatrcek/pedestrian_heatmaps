@@ -170,3 +170,7 @@ local_data/
 *.png
 *.jpg
 *.pdf
+
+!predstavitev/*
+
+.pt
